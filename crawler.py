@@ -1,15 +1,3 @@
-"""
-Website Crawler Scheduler with Enhanced Error Handling and Separate Schedules Per Website
-
-Major changes to support independent scheduling for each website:
-1. Instead of a single 'run_crawl_job' that blocks for all websites, we create one APScheduler job per website.
-2. Each website job runs 'run_crawl_for_site', which triggers and monitors the crawl for that website alone.
-3. If a long crawl (e.g., 24 hours) is in progress for one site, it won't block other sites from starting their scheduled crawls.
-4. Test mode (with --test) still runs all websites once in an aggregated manner, similar to the old behavior.
-
-ANSI color codes are retained for readability in terminal logs.
-"""
-
 import os
 import logging
 import time
@@ -53,6 +41,8 @@ class AppConfig:
     schedule_minutes: int
     website_filter: Set[str]
     test_mode: bool
+    space_id: Optional[str] = None
+    space_name: Optional[str] = None
     status_check_interval: int = 60  # Seconds between status checks
 
 class CrawlerAPIClient:
@@ -91,57 +81,112 @@ class CrawlerAPIClient:
             return ""
         return url.lower().strip().rstrip('/')
 
-    def get_websites(self) -> List[Dict]:
+    def get_spaces(self) -> List[Dict]:
         """
-        Fetch and filter registered websites with exact matching 
-        according to self.config.website_filter.
+        Fetch all spaces the user can access.
+        GET /api/v1/spaces/
         """
         try:
-            logger.info(f"{CYAN}Fetching websites from {self.config.base_url}{RESET}")
-            response = self.session.get(
-                f"{self.config.base_url}/websites/?for_tenant=false",
-                timeout=10
-            )
+            logger.info(f"{CYAN}Fetching all spaces from {self.config.base_url}/spaces/{RESET}")
+            response = self.session.get(f"{self.config.base_url}/spaces/", timeout=10)
             if not response.ok:
                 self._handle_api_error(response)
 
-            all_websites = response.json().get("items", [])
-            logger.info(f"{CYAN}Found {len(all_websites)} total websites{RESET}")
-
-            # If no filter provided, return all
-            if not self.config.website_filter:
-                return all_websites
-
-            filtered = []
-            for site in all_websites:
-                site_id = str(site.get("id", "")).strip()
-                site_name = str(site.get("name", "")).strip()
-                site_url = str(site.get("url", "")).strip()
-
-                # Create normalized identifiers
-                site_identifiers = {
-                    self._normalize_url(site_id),
-                    self._normalize_url(site_name),
-                    self._normalize_url(site_url)
-                }
-
-                # Check each filter string
-                for filter_str in self.config.website_filter:
-                    clean_filter = self._normalize_url(filter_str)
-                    if clean_filter in site_identifiers:
-                        filtered.append(site)
-                        logger.info(f"{GREEN}Matched filter '{filter_str}' to site '{site_name}'{RESET}")
-                        break
-
-            logger.info(f"{CYAN}Filter matched {len(filtered)} of {len(all_websites)} websites{RESET}")
-            return filtered
+            data = response.json()
+            spaces = data.get("items", [])
+            logger.info(f"{CYAN}Found {len(spaces)} space(s).{RESET}")
+            return spaces
 
         except requests.RequestException as e:
-            logger.error(f"{RED}Network error: {str(e)}{RESET}")
+            logger.error(f"{RED}Network error when fetching spaces: {str(e)}{RESET}")
             raise
         except Exception as e:
-            logger.error(f"{RED}Unexpected error: {str(e)}{RESET}")
+            logger.error(f"{RED}Unexpected error when fetching spaces: {str(e)}{RESET}")
             raise
+
+    def get_space_by_id(self, space_id: str) -> Dict:
+        """
+        Get a specific space by its ID.
+        GET /api/v1/spaces/{id}/
+        """
+        try:
+            logger.info(f"{CYAN}Fetching space by ID: {space_id}{RESET}")
+            response = self.session.get(f"{self.config.base_url}/spaces/{space_id}/", timeout=10)
+            if not response.ok:
+                self._handle_api_error(response)
+            return response.json()
+        except requests.RequestException as e:
+            logger.error(f"{RED}Network error fetching space {space_id}: {str(e)}{RESET}")
+            raise
+
+    def find_space_by_name(self, space_name: str) -> Optional[Dict]:
+        """
+        Find a space (in the list of spaces) whose 'name' matches space_name.
+        Returns the full space object if found, else None.
+        """
+        all_spaces = self.get_spaces()
+        space_name_lower = space_name.strip().lower()
+        for sp in all_spaces:
+            if sp.get("name", "").strip().lower() == space_name_lower:
+                return sp
+        return None
+
+    def get_websites_for_space(self) -> List[Dict]:
+        """
+        1) Determine which space to use (via config.space_id or config.space_name).
+        2) GET that space's details, which include 'knowledge' → 'websites' → 'items'.
+        3) Filter websites if self.config.website_filter is provided.
+        """
+        # 1. Determine space
+        if not self.config.space_id and not self.config.space_name:
+            logger.error(f"{RED}You must set either SPACE_ID or SPACE_NAME in the environment!{RESET}")
+            sys.exit(1)
+
+        if self.config.space_id:
+            # Directly get the space by ID
+            space_data = self.get_space_by_id(self.config.space_id)
+        else:
+            # Find space by name
+            found = self.find_space_by_name(self.config.space_name)
+            if not found:
+                logger.error(f"{RED}Could not find a space named '{self.config.space_name}'. Exiting...{RESET}")
+                sys.exit(1)
+            self.config.space_id = found["id"]  # Store for future reference
+            space_data = self.get_space_by_id(self.config.space_id)
+
+        # 2. Extract websites from 'knowledge' → 'websites' → 'items'
+        knowledge_data = space_data.get("knowledge", {})
+        websites_data = knowledge_data.get("websites", {})
+        all_websites = websites_data.get("items", [])
+        logger.info(f"{CYAN}Space '{space_data.get('name')}' has {len(all_websites)} website(s).{RESET}")
+
+        # 3. Filter if needed
+        if not self.config.website_filter:
+            logger.info(f"{CYAN}No WEBSITE_FILTER specified, returning all websites.{RESET}")
+            return all_websites
+
+        filtered = []
+        for site in all_websites:
+            site_id = str(site.get("id", "")).strip()
+            site_name = str(site.get("name", "")).strip()
+            site_url = str(site.get("url", "")).strip()
+
+            # Because 'name' can be None, we handle it as empty string in filters
+            site_identifiers = {
+                self._normalize_url(site_id),
+                self._normalize_url(site_name),
+                self._normalize_url(site_url),
+            }
+
+            for filter_str in self.config.website_filter:
+                clean_filter = self._normalize_url(filter_str)
+                if clean_filter in site_identifiers:
+                    filtered.append(site)
+                    logger.info(f"{GREEN}Matched filter '{filter_str}' to site '{site_name or site_id}'{RESET}")
+                    break
+
+        logger.info(f"{CYAN}Filter matched {len(filtered)} of {len(all_websites)} websites in space.{RESET}")
+        return filtered
 
     def trigger_crawl(self, website_id: str) -> Optional[Dict]:
         """Initiate a crawl with error handling"""
@@ -233,7 +278,6 @@ def run_crawl_for_site(config: AppConfig, api_client: CrawlerAPIClient, site: Di
 
         except Exception as e:
             logger.error(f"{RED}Status check error for {site_name}: {str(e)}{RESET}")
-            # We'll keep trying
             logger.info(f"{MAGENTA}Waiting {config.status_check_interval}s before retry...{RESET}")
             time.sleep(config.status_check_interval)
 
@@ -246,16 +290,17 @@ def run_all_sites_once(config: AppConfig, api_client: CrawlerAPIClient):
     """
     logger.info(f"{YELLOW}=== TEST MODE (single aggregated run) ==={RESET}")
     try:
-        websites = api_client.get_websites()
+        websites = api_client.get_websites_for_space()
     except Exception as e:
         logger.error(f"{RED}Failed to fetch websites in test mode: {str(e)}{RESET}")
         return
 
     if not websites:
-        logger.warning(f"{YELLOW}No websites matched filter criteria.{RESET}")
+        logger.warning(f"{YELLOW}No websites matched filter criteria in the space.{RESET}")
         return
 
-    logger.info(f"{CYAN}Found {len(websites)} websites for test mode: {[w.get('name') for w in websites]}{RESET}")
+    logger.info(f"{CYAN}Found {len(websites)} websites for test mode: "
+                f"{[w.get('name') or w.get('id') for w in websites]}{RESET}")
 
     # Trigger crawls for each site (serially)
     for site in websites:
@@ -297,12 +342,17 @@ def load_config() -> AppConfig:
     if args.websites:
         website_filter.update(args.websites.split(","))
 
+    space_id = os.getenv("SPACE_ID", "").strip()
+    space_name = os.getenv("SPACE_NAME", "").strip()
+
     return AppConfig(
         api_key=api_key,
         base_url=base_url,
         schedule_minutes=schedule,
         website_filter={s.strip().lower().rstrip('/') for s in website_filter if s.strip()},
-        test_mode=args.test
+        test_mode=args.test,
+        space_id=space_id if space_id else None,
+        space_name=space_name if space_name else None
     )
 
 def main():
@@ -319,9 +369,9 @@ def main():
     logger.info(f"{BLUE}Initializing scheduler with interval: {config.schedule_minutes} minutes{RESET}")
     scheduler = BackgroundScheduler(executors={'default': ThreadPoolExecutor(10)})
 
-    # Fetch and filter the websites
+    # Fetch and filter the websites from the designated space
     try:
-        websites = api_client.get_websites()
+        websites = api_client.get_websites_for_space()
     except Exception as e:
         logger.error(f"{RED}Failed to fetch websites: {str(e)}{RESET}")
         sys.exit(1)
